@@ -1,0 +1,39 @@
+# 宠邻 (pet-neighbor) — H5 静态站 + API 反代
+# 仓库: /root/pet-neighbor
+# 访问地址: http://YOUR_SERVER_IP/petn/
+#
+# H5 由 taro build --type h5 产出到 apps/client/dist/h5，rsync 到 /var/www/petn；
+# API 由 systemd pet-neighbor-api.service 监听 127.0.0.1:3001。
+# Taro h5 router.basename=/petn，SPA 深层路由需 try_files 回退 index.html。
+#
+# 缓存策略（2026-10-11）：Taro H5 是 hash 路由，浏览器只请求 /petn(/) 入口 HTML；
+# 入口必须 no-cache（每次协商复验），否则启发式缓存会让用户拿到旧 bundle 引用
+# （2026-10-11 曾因此出现"点击没反应"误报）。js/css 文件名带 contenthash，可 immutable 长缓存。
+
+@petn_api path /petn/api /petn/api/*
+@petn path /petn /petn/*
+
+@petn_html path /petn /petn/ /petn/index.html
+header @petn_html Cache-Control "no-cache"
+@petn_hashed path /petn/js/* /petn/css/*
+header @petn_hashed Cache-Control "public, max-age=31536000, immutable"
+
+handle @petn_api {
+	# /petn/api/v1/health → 剥掉 /petn 前缀 → /api/v1/health（NestJS global prefix 为 api/v1）
+	handle_path /petn/* {
+		reverse_proxy 127.0.0.1:3001
+	}
+}
+
+handle @petn {
+	# 防误发布点文件（与本机其他站点同款护栏）
+	@petnDot path /petn/.env* /petn/.git* /petn/.*
+	handle @petnDot {
+		respond 404
+	}
+	handle_path /petn/* {
+		root * /var/www/petn
+		try_files {path} /index.html
+		file_server
+	}
+}

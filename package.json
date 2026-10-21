@@ -1,0 +1,16 @@
+{
+  "name": "pet-neighbor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "宠邻：宠物互助小程序 + H5（Taro 双端 + NestJS API）",
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build:api": "pnpm --filter @pet-neighbor/api build",
+    "build:h5": "pnpm --filter @pet-neighbor/client build:h5",
+    "build:weapp": "pnpm --filter @pet-neighbor/client build:weapp",
+    "test:api": "pnpm --filter @pet-neighbor/api test"
+  }
+}

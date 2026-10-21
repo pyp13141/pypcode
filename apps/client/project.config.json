@@ -1,0 +1,18 @@
+{
+  "miniprogramRoot": "dist/weapp/",
+  "projectname": "pet-neighbor",
+  "description": "宠邻：宠物互助小程序",
+  "appid": "touristappid",
+  "setting": {
+    "urlCheck": false,
+    "es6": false,
+    "enhance": false,
+    "postcss": false,
+    "minified": false
+  },
+  "compileType": "miniprogram",
+  "libVersion": "3.5.0",
+  "srcMiniprogramRoot": "dist/weapp/",
+  "packOptions": { "ignore": [], "include": [] },
+  "condition": {}
+}

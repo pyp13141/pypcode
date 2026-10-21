@@ -1,0 +1,29 @@
+# CNB 云原生构建流水线
+# 语法: https://docs.cnb.cool/zh/build/configuration.html
+# main 分支 push 触发；任何一步失败即流水线失败。
+
+main:
+  push:
+    - name: pet-neighbor-ci
+      docker:
+        image: node:22
+      env:
+        CI: "true"
+      stages:
+        - name: install
+          script: |
+            npm i -g pnpm@9
+            pnpm config set registry https://registry.npmjs.org
+            pnpm install
+        - name: prisma-generate
+          script: pnpm --filter @pet-neighbor/api exec prisma generate
+        - name: check-docs
+          script: bash scripts/check-docs-sync.sh
+        - name: test-api
+          script: pnpm test:api
+        - name: build-api
+          script: pnpm build:api
+        - name: build-h5
+          script: pnpm build:h5
+        - name: build-weapp
+          script: pnpm build:weapp

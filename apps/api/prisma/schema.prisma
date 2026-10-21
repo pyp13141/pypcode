@@ -1,0 +1,1139 @@
+// 宠邻数据库 schema（docs/ERD.md 为人类可读总览，本文件是迁移单一源）
+// 约定：主键 UUID、时间 timestamptz（UTC）、金额整数分、审计表软删除。
+// M1 批次：identity（users/identities/sessions/private_profiles/blocks）+ pets。
+// M2 批次：care 九表 + M2 端点所需的治理支撑表（sensitive_access_logs / idempotency_records /
+//          disputes / dispute_events / reviews / media_assets，见 DECISIONS D-011）。
+// M3 批次：market 四表 + 集市闭环依赖的基础设施（媒体上传管线所需 media_assets 扩展、
+//          收藏复用 reactions、交易会话 conversations/messages，见 DECISIONS D-012）。
+// M4 批次：社区与治理（posts/comments/follows/reports/notifications/help_posts +
+//          admin_* 治理表 + badges + app_settings，见 DECISIONS D-013）。
+// M6 批次：健康与情绪日志（pet_health_logs / pet_mood_logs；只记录不产建议，产品 6.5/6.6）。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String    @id @default(uuid()) @db.Uuid
+  nickname  String
+  avatarUrl String?   @map("avatar_url")
+  bio       String?
+  /// 大致区域码（公开粗粒度位置，绝不存精确坐标）
+  areaCode  String?   @map("area_code")
+  /// ACTIVE / BANNED / DELETED（软删除由 deletedAt 表达）
+  status    String    @default("ACTIVE")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+
+  identities     UserIdentity[]
+  sessions       UserSession[]
+  privateProfile UserPrivateProfile?
+  pets           Pet[]
+  blockedBy      UserBlock[] @relation("blocked")
+  blocking       UserBlock[] @relation("blocker")
+  stations       UserStation[]
+  offerings      CareOffering[] @relation("OfferingProvider")
+  requests       CareRequest[]  @relation("RequestRequester")
+  applications   CareApplication[] @relation("ApplicationApplicant")
+  ordersAsRequester CareOrder[] @relation("OrderRequester")
+  ordersAsProvider  CareOrder[] @relation("OrderProvider")
+  evidenceCreated   CareEvidence[] @relation("EvidenceCreator")
+  mediaAssets       MediaAsset[]
+  sensitiveAccessLogs SensitiveAccessLog[]
+  idempotencyRecords  IdempotencyRecord[]
+  disputesOpened      Dispute[] @relation("DisputeOpenedBy")
+  disputesResolved    Dispute[] @relation("DisputeResolvedBy")
+  reviewsWritten      Review[] @relation("ReviewReviewer")
+  reviewsReceived     Review[] @relation("ReviewReviewee")
+  marketListings      MarketListing[] @relation("ListingSeller")
+  marketDealsBought   MarketDeal[] @relation("DealBuyer")
+  marketDealsSold     MarketDeal[] @relation("DealSeller")
+  reactions           Reaction[]
+  conversations       ConversationParticipant[]
+  messages            Message[]
+  posts               Post[]
+  comments            Comment[]
+  postHides           PostHide[]
+  followsFollowedBy   Follow[] @relation("FollowFollower")
+  followsFollowing    Follow[] @relation("FollowFollowed")
+  notifications       Notification[]
+  reportsFiled        Report[] @relation("ReportReporter")
+  reportsAssigned     Report[] @relation("ReportAssignee")
+  moderationActions   ModerationAction[]
+  adminAccount        AdminUser?
+  adminAuditLogs      AdminAuditLog[]
+  userBadges          UserBadge[]
+  helpPosts           HelpPost[]
+
+  @@index([status])
+  @@map("users")
+}
+
+model UserIdentity {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  /// WECHAT_MINIPROGRAM / H5_PHONE / EMAIL
+  provider  String
+  /// 微信 openid / 规范化手机号 / 规范化邮箱（D-014）；绝不作为主键
+  providerSubject String @map("provider_subject")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([provider, providerSubject])
+  @@index([userId])
+  @@map("user_identities")
+}
+
+model UserSession {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  /// 只存哈希，绝不存明文令牌（docs/ERD.md 不变量 1）
+  accessTokenHash  String    @unique @map("access_token_hash")
+  refreshTokenHash String   @unique @map("refresh_token_hash")
+  accessExpiresAt  DateTime  @map("access_expires_at") @db.Timestamptz()
+  refreshExpiresAt DateTime  @map("refresh_expires_at") @db.Timestamptz()
+  revokedAt        DateTime? @map("revoked_at") @db.Timestamptz()
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("user_sessions")
+}
+
+/// 私密资料独立表：手机号加密存储，读取必须走授权并记审计（M1 先落表，审计日志 M4 补）
+model UserPrivateProfile {
+  userId          String    @id @map("user_id") @db.Uuid
+  phoneEncrypted  String?   @map("phone_encrypted")
+  phoneMasked     String?   @map("phone_masked")
+  phoneVerifiedAt DateTime? @map("phone_verified_at") @db.Timestamptz()
+  /// 邮箱（D-014：首期用邮箱验证码替代手机号；AES-256-GCM）
+  emailEncrypted  String?   @map("email_encrypted")
+  emailMasked     String?   @map("email_masked")
+  emailVerifiedAt DateTime? @map("email_verified_at") @db.Timestamptz()
+  /// { profileVisibility: PUBLIC | FOLLOWERS | PRIVATE }
+  privacySettings Json      @default("{}") @map("privacy_settings")
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("user_private_profiles")
+}
+
+model UserBlock {
+  blockerUserId String   @map("blocker_user_id") @db.Uuid
+  blockedUserId String   @map("blocked_user_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  blocker User @relation("blocker", fields: [blockerUserId], references: [id])
+  blocked User @relation("blocked", fields: [blockedUserId], references: [id])
+
+  @@id([blockerUserId, blockedUserId])
+  @@map("user_blocks")
+}
+
+model Pet {
+  id          String    @id @default(uuid()) @db.Uuid
+  ownerUserId String    @map("owner_user_id") @db.Uuid
+  name        String
+  /// CAT / DOG / BIRD / SMALL_ANIMAL / OTHER
+  species     String
+  breed       String?
+  /// SEX: MALE / FEMALE / UNKNOWN
+  sex         String?
+  birthDate   DateTime? @map("birth_date") @db.Date()
+  weightValue Float?    @map("weight_value")
+  weightUnit  String?   @map("weight_unit")
+  weightMeasuredAt DateTime? @map("weight_measured_at") @db.Timestamptz()
+  /// STERILIZED: YES / NO / UNKNOWN
+  sterilized  String?
+  /// PRIVATE（默认）/ PUBLIC；健康与医疗字段任何可见性下都不对外（字段白名单）
+  visibility  String    @default("PRIVATE")
+  archivedAt  DateTime? @map("archived_at") @db.Timestamptz()
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  owner      User           @relation(fields: [ownerUserId], references: [id])
+  careNotes  PetCareNote[]
+  healthLogs PetHealthLog[]
+  moodLogs   PetMoodLog[]
+
+  @@index([ownerUserId, archivedAt])
+  @@map("pets")
+}
+
+/// 照料注意事项：默认仅主人可见；订单参与方按授权查看在 M2 实现（快照机制）
+model PetCareNote {
+  id         String   @id @default(uuid()) @db.Uuid
+  petId      String   @map("pet_id") @db.Uuid
+  /// DIET / BEHAVIOR / ALLERGY / EMERGENCY / OTHER
+  noteType   String   @map("note_type")
+  content    String
+  /// OWNER_ONLY / ORDER_PARTICIPANTS
+  visibility String   @default("OWNER_ONLY")
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  pet Pet @relation(fields: [petId], references: [id])
+
+  @@index([petId])
+  @@map("pet_care_notes")
+}
+
+// ===== 地铁（D-009：零地图 API，OSM 静态导入 + 本地图算法）=====
+
+model TransitCity {
+  id       String          @id @default(uuid()) @db.Uuid
+  name     String          @unique
+  pinyin   String?
+  status   String          @default("ACTIVE")
+  lines    TransitLine[]
+  stations TransitStation[]
+  userStations UserStation[]
+
+  @@map("transit_cities")
+}
+
+model TransitLine {
+  id       String  @id @default(uuid()) @db.Uuid
+  cityId   String  @map("city_id") @db.Uuid
+  name     String
+  ref      String
+  origin   String?
+  terminus String?
+  sort     Int     @default(0)
+
+  city        TransitCity           @relation(fields: [cityId], references: [id])
+  lineStations TransitLineStation[]
+
+  @@unique([cityId, ref])
+  @@map("transit_lines")
+}
+
+model TransitStation {
+  id         String  @id @default(uuid()) @db.Uuid
+  cityId     String  @map("city_id") @db.Uuid
+  name       String
+  lat        Float
+  lng        Float
+  /// OSM node id：导入幂等键
+  osmNodeId  String? @map("osm_node_id")
+
+  city        TransitCity           @relation(fields: [cityId], references: [id])
+  lineStations TransitLineStation[]
+  edgesFrom   TransitEdge[]         @relation("EdgeFrom")
+  edgesTo     TransitEdge[]         @relation("EdgeTo")
+  userStations UserStation[]
+
+  @@unique([cityId, osmNodeId])
+  @@index([cityId, name])
+  @@map("transit_stations")
+}
+
+model TransitLineStation {
+  lineId    String @map("line_id") @db.Uuid
+  stationId String @map("station_id") @db.Uuid
+  seq       Int
+
+  line    TransitLine    @relation(fields: [lineId], references: [id])
+  station TransitStation @relation(fields: [stationId], references: [id])
+
+  @@id([lineId, stationId])
+  @@unique([lineId, seq])
+  @@map("transit_line_stations")
+}
+
+/// 图的边：RIDE=同线相邻站；TRANSFER=同城换乘（同名/近距离站点连接）
+model TransitEdge {
+  fromStationId String @map("from_station_id") @db.Uuid
+  toStationId   String @map("to_station_id") @db.Uuid
+  kind          String
+  minutes       Decimal @db.Decimal(6, 2)
+
+  fromStation TransitStation @relation("EdgeFrom", fields: [fromStationId], references: [id])
+  toStation   TransitStation @relation("EdgeTo", fields: [toStationId], references: [id])
+
+  @@id([fromStationId, toStationId, kind])
+  @@index([toStationId])
+  @@map("transit_edges")
+}
+
+/// 用户常用地铁站（D-009：代替"最近地铁站"的地理编码方案）
+model UserStation {
+  userId    String @map("user_id") @db.Uuid
+  cityId    String @map("city_id") @db.Uuid
+  stationId String @map("station_id") @db.Uuid
+  label     String?
+
+  user    User          @relation(fields: [userId], references: [id])
+  city    TransitCity   @relation(fields: [cityId], references: [id])
+  station TransitStation @relation(fields: [stationId], references: [id])
+
+  @@id([userId, stationId])
+  @@map("user_stations")
+}
+
+// ===== M2 互助履约（docs/ERD.md §2；状态机权威 docs/STATE_MACHINES.md）=====
+// 通用约定：枚举用受约束字符串 + 迁移里的 CHECK；金额 bigint 整数分（视图层转 number）。
+
+/// 服务公告：服务者提供什么，不代表接受订单（STATE_MACHINES §1）
+model CareOffering {
+  id             String   @id @default(uuid()) @db.Uuid
+  providerUserId String   @map("provider_user_id") @db.Uuid
+  /// FEED / WALK / BOARD / OTHER
+  serviceType    String   @map("service_type")
+  title          String
+  description    String
+  areaCode       String   @map("area_code")
+  radiusKm       Float?   @map("radius_km")
+  /// FREE / FIXED / NEGOTIABLE / BARTER；FIXED 时 price_minor 必填（CHECK）
+  pricingType    String   @map("pricing_type")
+  priceMinor     BigInt?  @map("price_minor")
+  cancelRule     String   @map("cancel_rule")
+  /// DRAFT / PUBLISHED / PAUSED / ARCHIVED / REMOVED（REMOVED 仅审核路径）
+  status         String   @default("DRAFT")
+  removedReason  String?  @map("removed_reason")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  provider       User                      @relation("OfferingProvider", fields: [providerUserId], references: [id])
+  availabilities CareOfferingAvailability[]
+  applications   CareApplication[]
+  orders         CareOrder[]
+
+  @@index([areaCode, serviceType, status])
+  @@index([providerUserId, status])
+  @@map("care_offerings")
+}
+
+/// 可用时段（公告下）：UNIQUE(offering_id, start_at) 防重复录入同刻时段
+model CareOfferingAvailability {
+  id         String   @id @default(uuid()) @db.Uuid
+  offeringId String   @map("offering_id") @db.Uuid
+  startAt    DateTime @map("start_at") @db.Timestamptz()
+  endAt      DateTime @map("end_at") @db.Timestamptz()
+  capacity   Int      @default(1)
+  /// OPEN / CLOSED
+  status     String   @default("OPEN")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  offering CareOffering @relation(fields: [offeringId], references: [id])
+
+  @@unique([offeringId, startAt])
+  @@map("care_offerings_availability")
+}
+
+/// 求助需求：无精确地址字段——地址只活在 care_order_private_details（ERD §6.6）
+model CareRequest {
+  id                String    @id @default(uuid()) @db.Uuid
+  requesterUserId   String    @map("requester_user_id") @db.Uuid
+  serviceType       String    @map("service_type")
+  title             String
+  description       String
+  areaCode          String    @map("area_code")
+  startAt           DateTime  @map("start_at") @db.Timestamptz()
+  endAt             DateTime  @map("end_at") @db.Timestamptz()
+  /// 频次描述（如"每天2次"，自由文本≤100）
+  frequency         String?
+  /// 服务快照来源宠物（1-5 只，属于需求方；下单时快照进 agreed_terms）
+  petIds            String[]  @map("pet_ids") @db.Uuid
+  pricingType       String    @map("pricing_type")
+  priceMinor        BigInt?   @map("price_minor")
+  cancelRule        String    @map("cancel_rule")
+  /// 紧急联系人（AES-256-GCM，D-008）；接受时复制进订单私密表，绝不出现在公开响应
+  emergencyContactEncrypted String? @map("emergency_contact_encrypted")
+  /// DRAFT / PUBLISHED / MATCHED / CANCELLED / EXPIRED
+  status            String    @default("DRAFT")
+  matchedAt         DateTime? @map("matched_at") @db.Timestamptz()
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt         DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  requester    User              @relation("RequestRequester", fields: [requesterUserId], references: [id])
+  applications CareApplication[]
+  orders       CareOrder[]
+
+  @@index([status, areaCode, serviceType])
+  @@index([requesterUserId, status])
+  @@map("care_requests")
+}
+
+/// 服务申请：UNIQUE(request_id, applicant_user_id)；接受走 accept 关键事务
+model CareApplication {
+  id                 String    @id @default(uuid()) @db.Uuid
+  requestId          String    @map("request_id") @db.Uuid
+  offeringId         String?   @map("offering_id") @db.Uuid
+  applicantUserId    String    @map("applicant_user_id") @db.Uuid
+  message            String
+  proposedPriceMinor BigInt?   @map("proposed_price_minor")
+  /// PENDING / ACCEPTED / REJECTED / WITHDRAWN / EXPIRED（每申请只有一个终态）
+  status             String    @default("PENDING")
+  decidedAt          DateTime? @map("decided_at") @db.Timestamptz()
+  /// 拒绝/撤回原因（API §3：reject/withdraw 记 reason；accept 不使用）
+  decisionNote       String?   @map("decision_note")
+  /// 接受后回填（不加 FK：避免与 care_orders 循环依赖，ERD §2 注）
+  careOrderId        String?   @map("care_order_id") @db.Uuid
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  request   CareRequest   @relation(fields: [requestId], references: [id])
+  offering  CareOffering? @relation(fields: [offeringId], references: [id])
+  applicant User          @relation("ApplicationApplicant", fields: [applicantUserId], references: [id])
+
+  @@unique([requestId, applicantUserId])
+  @@index([requestId, status])
+  @@map("care_applications")
+}
+
+/// 服务订单：状态机见 STATE_MACHINES §4；条款快照固化，存量订单不受公告变更影响
+model CareOrder {
+  id                String    @id @default(uuid()) @db.Uuid
+  /// 业务公开编号（非自增）：PN + yyMMdd + 随机段
+  orderNo           String    @unique @map("order_no")
+  offeringId        String?   @map("offering_id") @db.Uuid
+  requestId         String?   @map("request_id") @db.Uuid
+  applicationId     String?   @map("application_id") @db.Uuid
+  requesterUserId   String    @map("requester_user_id") @db.Uuid
+  providerUserId    String    @map("provider_user_id") @db.Uuid
+  /// PENDING_CONFIRMATION / CONFIRMED / IN_PROGRESS / COMPLETION_SUBMITTED /
+  /// COMPLETED / CANCEL_REQUESTED / CANCELLED / DISPUTED
+  status            String    @default("PENDING_CONFIRMATION")
+  pricingType       String    @map("pricing_type")
+  priceMinor        BigInt?   @map("price_minor")
+  /// 条款快照（jsonb）：价格/取消规则/责任/地址访问规则/条款版本/宠物快照
+  agreedTermsJson   Json      @map("agreed_terms_json")
+  termsVersion      String    @default("v1") @map("terms_version")
+  confirmedByRequesterAt DateTime? @map("confirmed_by_requester_at") @db.Timestamptz()
+  confirmedByProviderAt  DateTime? @map("confirmed_by_provider_at") @db.Timestamptz()
+  completedAt       DateTime? @map("completed_at") @db.Timestamptz()
+  cancelledAt       DateTime? @map("cancelled_at") @db.Timestamptz()
+  cancelReasonCode  String?   @map("cancel_reason_code")
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt         DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  offering      CareOffering?           @relation(fields: [offeringId], references: [id])
+  request       CareRequest?            @relation(fields: [requestId], references: [id])
+  requester     User                    @relation("OrderRequester", fields: [requesterUserId], references: [id])
+  provider      User                    @relation("OrderProvider", fields: [providerUserId], references: [id])
+  events        CareOrderEvent[]
+  privateDetail CareOrderPrivateDetail?
+  visits        CareVisit[]
+  disputes      Dispute[]
+  conversations Conversation[]
+
+  @@index([requesterUserId, status])
+  @@index([providerUserId, status])
+  @@index([requestId])
+  @@map("care_orders")
+}
+
+/// 状态历史：追加式（迁移里加了禁止 UPDATE/DELETE 的触发器）
+model CareOrderEvent {
+  id          String   @id @default(uuid()) @db.Uuid
+  careOrderId String   @map("care_order_id") @db.Uuid
+  fromStatus  String?  @map("from_status")
+  toStatus    String   @map("to_status")
+  actorUserId String   @map("actor_user_id") @db.Uuid
+  /// REQUESTER / PROVIDER / ADMIN
+  actorRole   String   @map("actor_role")
+  reasonCode  String?  @map("reason_code")
+  note        String?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  order CareOrder @relation(fields: [careOrderId], references: [id])
+
+  @@index([careOrderId, createdAt])
+  @@map("care_order_events")
+}
+
+/// 私密履约信息 ⭐：AES-256-GCM；不进任何通用订单查询的 JOIN；
+/// 读写路径唯一：参与方+状态联合校验 → 加解密 → 写 sensitive_access_logs（ERD 不变量）
+model CareOrderPrivateDetail {
+  careOrderId                String   @id @map("care_order_id") @db.Uuid
+  addressEncrypted           String?  @map("address_encrypted")
+  entryInstructionsEncrypted String?  @map("entry_instructions_encrypted")
+  emergencyContactEncrypted  String?  @map("emergency_contact_encrypted")
+  /// { readableStatuses: [...] } 地址访问规则快照
+  accessPolicy               Json     @default("{}") @map("access_policy")
+  createdAt                  DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt                  DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  order CareOrder @relation(fields: [careOrderId], references: [id])
+
+  @@map("care_order_private_details")
+}
+
+/// 单次上门：UNIQUE(care_order_id, seq)；多次上门需全部完成才能提交整体完成
+model CareVisit {
+  id          String    @id @default(uuid()) @db.Uuid
+  careOrderId String    @map("care_order_id") @db.Uuid
+  seq         Int
+  scheduledAt DateTime  @map("scheduled_at") @db.Timestamptz()
+  startedAt   DateTime? @map("started_at") @db.Timestamptz()
+  completedAt DateTime? @map("completed_at") @db.Timestamptz()
+  /// SCHEDULED / IN_PROGRESS / COMPLETION_SUBMITTED / COMPLETED / MISSED / CANCELLED / EXCEPTION
+  status      String    @default("SCHEDULED")
+  notes       String?
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  order    CareOrder      @relation(fields: [careOrderId], references: [id])
+  evidence CareEvidence[]
+
+  @@unique([careOrderId, seq])
+  @@map("care_visits")
+}
+
+/// 履约凭证：PHOTO 走 media_assets（上传管线 M4），NOTE 存文本；读取写敏感审计
+model CareEvidence {
+  id           String   @id @default(uuid()) @db.Uuid
+  careVisitId  String   @map("care_visit_id") @db.Uuid
+  mediaAssetId String?  @map("media_asset_id") @db.Uuid
+  /// PHOTO / NOTE
+  evidenceType String   @map("evidence_type")
+  /// NOTE 型凭证文本（PHOTO 型可为空）
+  note         String?
+  createdBy    String   @map("created_by") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  visit      CareVisit   @relation(fields: [careVisitId], references: [id])
+  mediaAsset MediaAsset? @relation(fields: [mediaAssetId], references: [id])
+  creator    User        @relation("EvidenceCreator", fields: [createdBy], references: [id])
+
+  @@index([careVisitId])
+  @@map("care_evidence")
+}
+
+/// 媒体资产（M2 先落表供履约凭证 FK；M3 起启用上传管线：授权→直传→finalize）
+model MediaAsset {
+  id               String    @id @default(uuid()) @db.Uuid
+  ownerUserId      String    @map("owner_user_id") @db.Uuid
+  /// 对象 key 不可预测随机串
+  objectKey        String    @unique @map("object_key")
+  /// PET_AVATAR / POST_IMAGE / LISTING_IMAGE / EVIDENCE
+  purpose          String
+  /// 上传授权时未知，finalize 后回填
+  mimeType         String?   @map("mime_type")
+  sizeBytes        BigInt?   @map("size_bytes")
+  /// 授权有效期（短时上传窗口）
+  uploadExpiresAt  DateTime? @map("upload_expires_at") @db.Timestamptz()
+  /// 直传完成登记时间（null=尚未上传）
+  finalizedAt      DateTime? @map("finalized_at") @db.Timestamptz()
+  /// PENDING / APPROVED / REJECTED
+  moderationStatus String    @default("PENDING") @map("moderation_status")
+  moderationNote   String?   @map("moderation_note")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  owner        User                @relation(fields: [ownerUserId], references: [id])
+  evidence     CareEvidence[]
+  listingMedia MarketListingMedia[]
+  postMedia    PostMedia[]
+
+  @@index([ownerUserId, purpose])
+  @@index([ownerUserId, createdAt])
+  @@map("media_assets")
+}
+
+/// 敏感字段访问审计（ERD 不变量 6）：每次读取/写入敏感字段组必写一行
+model SensitiveAccessLog {
+  id           String   @id @default(uuid()) @db.Uuid
+  actorUserId  String   @map("actor_user_id") @db.Uuid
+  /// CARE_ORDER / MEDIA / PROFILE
+  resourceType String   @map("resource_type")
+  resourceId   String   @map("resource_id") @db.Uuid
+  /// ADDRESS / PHONE / EVIDENCE / EMERGENCY_CONTACT
+  fieldGroup   String   @map("field_group")
+  purpose      String
+  /// 关联请求 id（RequestIdMiddleware 注入）
+  requestId    String?  @map("request_id")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  actor User @relation(fields: [actorUserId], references: [id])
+
+  @@index([resourceType, resourceId])
+  @@index([actorUserId, createdAt])
+  @@map("sensitive_access_logs")
+}
+
+/// 幂等记录：UNIQUE(user_id, idempotency_key)；同 key 不同请求体哈希 → 冲突
+model IdempotencyRecord {
+  id             String   @id @default(uuid()) @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  idempotencyKey String   @map("idempotency_key")
+  requestHash    String   @map("request_hash")
+  /// null=处理中（占位行），完成/重放后写响应状态码
+  responseStatus Int?     @map("response_status")
+  /// 结果引用（如 orderId/visitId/reviewId），重放时按引用重读
+  responseRef    String?  @map("response_ref")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  expiresAt      DateTime @map("expires_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, idempotencyKey])
+  @@map("idempotency_records")
+}
+
+/// 纠纷工单 ⭐与 reports 分离；恰一外键非空（CHECK）
+model Dispute {
+  id             String    @id @default(uuid()) @db.Uuid
+  /// CARE / MARKET
+  caseType       String    @map("case_type")
+  careOrderId    String?   @map("care_order_id") @db.Uuid
+  marketDealId   String?   @map("market_deal_id") @db.Uuid
+  openedBy       String    @map("opened_by") @db.Uuid
+  reasonCode     String    @map("reason_code")
+  description    String
+  /// OPEN / EVIDENCE / PENDING_RULING / RULED / APPEALING / CLOSED
+  status         String    @default("OPEN")
+  resolutionCode String?   @map("resolution_code")
+  resolvedBy     String?   @map("resolved_by") @db.Uuid
+  resolvedAt     DateTime? @map("resolved_at") @db.Timestamptz()
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  careOrder    CareOrder?    @relation(fields: [careOrderId], references: [id])
+  openedByUser User          @relation("DisputeOpenedBy", fields: [openedBy], references: [id])
+  resolvedByUser User?       @relation("DisputeResolvedBy", fields: [resolvedBy], references: [id])
+  events       DisputeEvent[]
+
+  @@index([careOrderId])
+  @@index([status])
+  @@map("disputes")
+}
+
+/// 纠纷处理历史：追加式（迁移里加了禁止 UPDATE/DELETE 的触发器）
+model DisputeEvent {
+  id          String   @id @default(uuid()) @db.Uuid
+  disputeId   String   @map("dispute_id") @db.Uuid
+  actorUserId String   @map("actor_user_id") @db.Uuid
+  /// REQUESTER / PROVIDER / ADMIN / SYSTEM
+  actorRole   String   @map("actor_role")
+  /// EVIDENCE_ADD / COMMENT / RULING / APPEAL / SYSTEM
+  eventType   String   @map("event_type")
+  note        String?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  dispute Dispute @relation(fields: [disputeId], references: [id])
+
+  @@index([disputeId, createdAt])
+  @@map("dispute_events")
+}
+
+/// 评价：UNIQUE(target_type, target_id, reviewer_user_id)——每订单每方一次；
+/// 目标必须 COMPLETED（服务层校验）；争议期间暂缓公开展示（DISPUTED_HIDDEN）
+model Review {
+  id             String   @id @default(uuid()) @db.Uuid
+  reviewerUserId String   @map("reviewer_user_id") @db.Uuid
+  revieweeUserId String   @map("reviewee_user_id") @db.Uuid
+  /// CARE_ORDER / MARKET_DEAL
+  targetType     String   @map("target_type")
+  targetId       String   @map("target_id") @db.Uuid
+  /// 评价者角色（谁评谁）：REQUESTER / PROVIDER / BUYER / SELLER
+  role           String
+  rating         Int
+  tags           String[]
+  content        String?
+  /// VISIBLE / HIDDEN / DISPUTED_HIDDEN / DELETED
+  status         String   @default("VISIBLE")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  reviewer User @relation("ReviewReviewer", fields: [reviewerUserId], references: [id])
+  reviewee User @relation("ReviewReviewee", fields: [revieweeUserId], references: [id])
+
+  @@unique([targetType, targetId, reviewerUserId])
+  @@index([revieweeUserId, status])
+  @@map("reviews")
+}
+
+// ===== M3 集市与交易（docs/ERD.md §3；状态机 docs/STATE_MACHINES.md §6）=====
+
+/// 集市分类（种子数据；HIGH 风险类目（宠物食品/药品）发布进人工审核）
+model MarketCategory {
+  id        String   @id @default(uuid()) @db.Uuid
+  parentId  String?  @map("parent_id") @db.Uuid
+  code      String   @unique
+  name      String
+  /// LOW / MEDIUM / HIGH（HIGH 必须人审）
+  riskLevel String   @default("LOW") @map("risk_level")
+  /// ACTIVE / DISABLED
+  status    String   @default("ACTIVE")
+  sort      Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  parent   MarketCategory?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children MarketCategory[] @relation("CategoryTree")
+  listings MarketListing[]
+
+  @@map("market_categories")
+}
+
+/// 集市公告（列表态；DRAFT/PUBLISHED/PENDING_REVIEW/SOLD/REMOVED/EXPIRED）
+model MarketListing {
+  id             String   @id @default(uuid()) @db.Uuid
+  sellerUserId   String   @map("seller_user_id") @db.Uuid
+  /// GIFT / SWAP / SALE / WANTED
+  listingType    String   @map("listing_type")
+  categoryId     String   @map("category_id") @db.Uuid
+  title          String
+  description    String
+  /// SALE 必填>0；GIFT 必须 NULL/0（CHECK 与 listing_type 组合）
+  priceMinor     BigInt?  @map("price_minor")
+  /// 物品状态：NEW / LIKE_NEW / GOOD / FAIR（WANTED 可为空）
+  condition      String?
+  areaCode       String   @map("area_code")
+  /// 可交接时间窗（自由文本，如"周末下午"）
+  handoverWindow String?  @map("handover_window")
+  /// DRAFT / PUBLISHED / PENDING_REVIEW / SOLD / REMOVED / EXPIRED
+  status         String   @default("DRAFT")
+  removedReason  String?  @map("removed_reason")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  seller  User                 @relation("ListingSeller", fields: [sellerUserId], references: [id])
+  category MarketCategory      @relation(fields: [categoryId], references: [id])
+  media   MarketListingMedia[]
+  deals   MarketDeal[]
+
+  @@index([categoryId, areaCode, status])
+  @@index([sellerUserId, status])
+  @@map("market_listings")
+}
+
+/// 列表图片（媒体管线产物；UNIQUE(listing_id, media_asset_id)）
+model MarketListingMedia {
+  listingId    String @map("listing_id") @db.Uuid
+  mediaAssetId String @map("media_asset_id") @db.Uuid
+  sortOrder    Int    @default(0) @map("sort_order")
+
+  listing    MarketListing @relation(fields: [listingId], references: [id])
+  mediaAsset MediaAsset    @relation(fields: [mediaAssetId], references: [id])
+
+  @@id([listingId, mediaAssetId])
+  @@map("market_listing_media")
+}
+
+/// 交易记录（无任何资金字段；一物一单由事务行锁保证，D-012）
+model MarketDeal {
+  id             String    @id @default(uuid()) @db.Uuid
+  listingId      String    @map("listing_id") @db.Uuid
+  buyerUserId    String    @map("buyer_user_id") @db.Uuid
+  sellerUserId   String    @map("seller_user_id") @db.Uuid
+  /// CONTACTED / AGREEMENT_PENDING / AGREED / HANDED_OVER / COMPLETED / CANCELLED / DISPUTED
+  status         String    @default("CONTACTED")
+  handoverAt     DateTime? @map("handover_at") @db.Timestamptz()
+  /// 商圈级交接地点（不强制住址）
+  handoverArea   String?   @map("handover_area")
+  /// 交接约定快照（时间/地点/备注）
+  agreementJson  Json?     @map("agreement_json")
+  completedAt    DateTime? @map("completed_at") @db.Timestamptz()
+  cancelledAt    DateTime? @map("cancelled_at") @db.Timestamptz()
+  cancelReasonCode String? @map("cancel_reason_code")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  listing MarketListing   @relation(fields: [listingId], references: [id])
+  buyer   User            @relation("DealBuyer", fields: [buyerUserId], references: [id])
+  seller  User            @relation("DealSeller", fields: [sellerUserId], references: [id])
+  events  MarketDealEvent[]
+  conversation Conversation?
+
+  @@index([listingId, status])
+  @@index([buyerUserId, status])
+  @@index([sellerUserId, status])
+  @@map("market_deals")
+}
+
+/// 交易状态历史：追加式（触发器拒绝 UPDATE/DELETE）
+model MarketDealEvent {
+  id            String   @id @default(uuid()) @db.Uuid
+  marketDealId  String   @map("market_deal_id") @db.Uuid
+  fromStatus    String?  @map("from_status")
+  toStatus      String   @map("to_status")
+  actorUserId   String   @map("actor_user_id") @db.Uuid
+  /// BUYER / SELLER / ADMIN / SYSTEM
+  actorRole     String   @map("actor_role")
+  reasonCode    String?  @map("reason_code")
+  note          String?
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  deal MarketDeal @relation(fields: [marketDealId], references: [id])
+
+  @@index([marketDealId, createdAt])
+  @@map("market_deal_events")
+}
+
+/// 互动（点赞/收藏）：四元组唯一；target_type 含 LISTING（集市收藏，D-012）
+model Reaction {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  /// POST / COMMENT / LISTING
+  targetType   String   @map("target_type")
+  targetId     String   @map("target_id") @db.Uuid
+  /// LIKE / FAVORITE
+  reactionType String   @map("reaction_type")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, targetType, targetId, reactionType])
+  @@index([targetType, targetId])
+  @@map("reactions")
+}
+
+/// 受限会话（交易/订单沟通）：恰一业务对象非空
+model Conversation {
+  id           String   @id @default(uuid()) @db.Uuid
+  /// CARE_ORDER / MARKET_DEAL
+  conversationType String @map("conversation_type")
+  relatedOrderId String? @unique @map("related_order_id") @db.Uuid
+  relatedDealId  String? @unique @map("related_deal_id") @db.Uuid
+  /// ACTIVE / CLOSED
+  status       String   @default("ACTIVE")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  relatedOrder CareOrder?  @relation(fields: [relatedOrderId], references: [id])
+  relatedDeal  MarketDeal? @relation(fields: [relatedDealId], references: [id])
+  participants ConversationParticipant[]
+  messages     Message[]
+
+  @@index([relatedOrderId])
+  @@map("conversations")
+}
+
+/// 会话参与方（复合 PK）
+model ConversationParticipant {
+  conversationId String @map("conversation_id") @db.Uuid
+  userId         String @map("user_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  conversation Conversation @relation(fields: [conversationId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+
+  @@id([conversationId, userId])
+  @@map("conversation_participants")
+}
+
+/// 消息（限流在应用层；关键词风险提醒前端展示）
+model Message {
+  id             String    @id @default(uuid()) @db.Uuid
+  conversationId String    @map("conversation_id") @db.Uuid
+  senderUserId   String    @map("sender_user_id") @db.Uuid
+  content        String
+  /// SENT / DELETED
+  status         String    @default("SENT")
+  deletedAt      DateTime? @map("deleted_at") @db.Timestamptz()
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  conversation Conversation @relation(fields: [conversationId], references: [id])
+  sender       User         @relation(fields: [senderUserId], references: [id])
+
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+// ===== M4 社区与治理（docs/ERD.md §4；D-010 求助帖；D-013 落地细则）=====
+
+/// 社区帖子（NORMAL 图文 / HELP 求助帖壳，D-010 两层模型）
+model Post {
+  id               String    @id @default(uuid()) @db.Uuid
+  authorUserId     String    @map("author_user_id") @db.Uuid
+  /// NORMAL / HELP
+  postType         String    @default("NORMAL") @map("post_type")
+  content          String
+  /// PUBLIC / FOLLOWERS / PRIVATE
+  visibility       String    @default("PUBLIC")
+  /// PENDING / APPROVED / REJECTED（新号/命中风险关键词进 PENDING 转人工）
+  moderationStatus String    @default("APPROVED") @map("moderation_status")
+  hiddenAt         DateTime? @map("hidden_at") @db.Timestamptz()
+  deletedAt        DateTime? @map("deleted_at") @db.Timestamptz()
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  author   User        @relation(fields: [authorUserId], references: [id])
+  media    PostMedia[]
+  comments Comment[]
+  hides    PostHide[]
+  helpPost HelpPost?
+
+  @@index([moderationStatus, createdAt])
+  @@index([authorUserId, createdAt])
+  @@map("posts")
+}
+
+/// 帖子图片（对齐 market_listing_media）
+model PostMedia {
+  postId       String @map("post_id") @db.Uuid
+  mediaAssetId String @map("media_asset_id") @db.Uuid
+  sortOrder    Int    @default(0) @map("sort_order")
+
+  post       Post       @relation(fields: [postId], references: [id])
+  mediaAsset MediaAsset  @relation(fields: [mediaAssetId], references: [id])
+
+  @@id([postId, mediaAssetId])
+  @@map("post_media")
+}
+
+/// 评论（两级回复；删除为软删，审计保留）
+model Comment {
+  id           String    @id @default(uuid()) @db.Uuid
+  postId       String    @map("post_id") @db.Uuid
+  authorUserId String    @map("author_user_id") @db.Uuid
+  /// 仅两级：父评论的 parent_id 必须为空（服务层校验）
+  parentId     String?   @map("parent_id") @db.Uuid
+  content      String
+  /// VISIBLE / DELETED
+  status       String    @default("VISIBLE")
+  deletedAt    DateTime? @map("deleted_at") @db.Timestamptz()
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  post   Post      @relation(fields: [postId], references: [id])
+  author User      @relation(fields: [authorUserId], references: [id])
+  parent Comment?  @relation("CommentReplies", fields: [parentId], references: [id])
+  replies Comment[] @relation("CommentReplies")
+
+  @@index([postId, createdAt])
+  @@map("comments")
+}
+
+/// 「不感兴趣」本地偏好（API §5：仅影响当前用户信息流；ERD 未列，D-013 补口）
+model PostHide {
+  userId    String   @map("user_id") @db.Uuid
+  postId    String   @map("post_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id])
+  post Post @relation(fields: [postId], references: [id])
+
+  @@id([userId, postId])
+  @@map("post_hides")
+}
+
+/// 关注（复合 PK；CHECK 禁自关注）
+model Follow {
+  followerUserId String   @map("follower_user_id") @db.Uuid
+  followedUserId String   @map("followed_user_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  follower User @relation("FollowFollower", fields: [followerUserId], references: [id])
+  followed User @relation("FollowFollowed", fields: [followedUserId], references: [id])
+
+  @@id([followerUserId, followedUserId])
+  @@index([followedUserId])
+  @@map("follows")
+}
+
+/// 内容举报工单（与 disputes 分离）
+model Report {
+  id             String    @id @default(uuid()) @db.Uuid
+  reporterUserId String    @map("reporter_user_id") @db.Uuid
+  /// USER / POST / COMMENT / LISTING / OFFERING / REQUEST / DEAL / CONVERSATION / MESSAGE
+  targetType     String    @map("target_type")
+  targetId       String    @map("target_id") @db.Uuid
+  /// SCAM / HARASSMENT / MISINFO / DANGEROUS / ANIMAL_ABUSE / PROHIBITED / IP / AD / OTHER
+  reason         String
+  details        String?
+  images         String[]  @db.Uuid
+  /// NEW / PROCESSING / RESOLVED / DISMISSED / APPEALING / CLOSED
+  status         String    @default("NEW")
+  assignedAdminId String?  @map("assigned_admin_id") @db.Uuid
+  resolutionNote String?   @map("resolution_note")
+  resolvedAt     DateTime? @map("resolved_at") @db.Timestamptz()
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  reporter      User  @relation("ReportReporter", fields: [reporterUserId], references: [id])
+  assignedAdmin User? @relation("ReportAssignee", fields: [assignedAdminId], references: [id])
+
+  @@index([status, createdAt])
+  @@index([reporterUserId, createdAt])
+  @@map("reports")
+}
+
+/// 通知（站内信；payload_json 承载业务对象引用）
+model Notification {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  type        String
+  payloadJson Json      @default("{}") @map("payload_json")
+  readAt      DateTime? @map("read_at") @db.Timestamptz()
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, readAt, createdAt])
+  @@map("notifications")
+}
+
+/// 内容处置记录（后台审核动作审计）
+model ModerationAction {
+  id          String   @id @default(uuid()) @db.Uuid
+  targetType  String   @map("target_type")
+  targetId    String   @map("target_id") @db.Uuid
+  action      String
+  reason      String
+  adminId     String   @map("admin_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  admin User @relation(fields: [adminId], references: [id])
+
+  @@index([targetType, targetId])
+  @@map("moderation_actions")
+}
+
+/// 后台角色（11.6 五角色；种子数据）
+model AdminRole {
+  id              String   @id @default(uuid()) @db.Uuid
+  /// content_moderator / support_operator / catalog_operator / analyst / super_admin
+  code            String   @unique
+  name            String
+  permissionsJson Json     @default("{}") @map("permissions_json")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  admins AdminUser[]
+
+  @@map("admin_roles")
+}
+
+/// 后台账号（user_id 唯一；最小权限）
+model AdminUser {
+  userId    String   @id @map("user_id") @db.Uuid
+  roleId    String   @map("role_id") @db.Uuid
+  /// ACTIVE / DISABLED
+  status    String   @default("ACTIVE")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  user User      @relation(fields: [userId], references: [id])
+  role AdminRole @relation(fields: [roleId], references: [id])
+
+  @@map("admin_users")
+}
+
+/// 后台操作审计（追加式：触发器拒绝 UPDATE/DELETE）
+model AdminAuditLog {
+  id           String   @id @default(uuid()) @db.Uuid
+  adminUserId  String   @map("admin_user_id") @db.Uuid
+  action       String
+  resourceType String   @map("resource_type")
+  resourceId   String?  @map("resource_id")
+  requestId    String?  @map("request_id")
+  reason       String?
+  detailJson   Json     @default("{}") @map("detail_json")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  admin User @relation(fields: [adminUserId], references: [id])
+
+  @@index([adminUserId, createdAt])
+  @@map("admin_audit_logs")
+}
+
+/// 徽章定义（种子；规则在 rule_json，服务端判定）
+model Badge {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique
+  name      String
+  ruleJson  Json     @default("{}") @map("rule_json")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  userBadges UserBadge[]
+
+  @@map("badges")
+}
+
+model UserBadge {
+  userId       String   @map("user_id") @db.Uuid
+  badgeId      String   @map("badge_id") @db.Uuid
+  earnedAt     DateTime @default(now()) @map("earned_at") @db.Timestamptz()
+  metadataJson Json     @default("{}") @map("metadata_json")
+
+  user  User  @relation(fields: [userId], references: [id])
+  badge Badge @relation(fields: [badgeId], references: [id])
+
+  @@id([userId, badgeId])
+  @@map("user_badges")
+}
+
+/// 通用求助帖（D-010 轻量层：无订单机制，评论+站内响应）
+model HelpPost {
+  id           String    @id @default(uuid()) @db.Uuid
+  /// 1:1 帖子壳（post_type=HELP，承载内容与审核）
+  postId       String    @unique @map("post_id") @db.Uuid
+  authorUserId String    @map("author_user_id") @db.Uuid
+  /// PET_CARE / NEIGHBOR（首期白名单，D-010）
+  category     String
+  title        String
+  cityId       String?   @map("city_id") @db.Uuid
+  stationId    String?   @map("station_id") @db.Uuid
+  deadlineAt   DateTime? @map("deadline_at") @db.Timestamptz()
+  /// OPEN / RESOLVED / CLOSED / EXPIRED
+  status       String    @default("OPEN")
+  resolvedAt   DateTime? @map("resolved_at") @db.Timestamptz()
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  post   Post @relation(fields: [postId], references: [id])
+  author User @relation(fields: [authorUserId], references: [id])
+
+  @@index([status, category, createdAt])
+  @@index([authorUserId, status])
+  @@map("help_posts")
+}
+
+/// 运营配置（键值；leaderboard-config / risk-rules 等，D-013）
+model AppSetting {
+  key       String   @id
+  valueJson Json     @map("value_json")
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+  updatedBy String?  @map("updated_by") @db.Uuid
+
+  @@map("app_settings")
+}
+
+// ===== M6 健康与成长（docs/ERD.md §5；只存记录不产建议，非诊断，产品 6.5）=====
+
+/// 健康日志：趋势查询索引 (pet_id, log_type, recorded_at)
+model PetHealthLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  petId      String   @map("pet_id") @db.Uuid
+  /// WEIGHT / DIET / WATER / ACTIVITY / EVENT
+  logType    String   @map("log_type")
+  valueNum   Float?   @map("value_num")
+  unit       String?
+  recordedAt DateTime @map("recorded_at") @db.Timestamptz()
+  /// MANUAL / DEVICE / VET
+  source     String   @default("MANUAL")
+  notes      String?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  pet Pet @relation(fields: [petId], references: [id])
+
+  @@index([petId, logType, recordedAt])
+  @@map("pet_health_logs")
+}
+
+/// 情绪日志：主观观察标签，非诊断结论（产品 6.5）
+model PetMoodLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  petId      String   @map("pet_id") @db.Uuid
+  /// 观察标签：平静/活跃/紧张/躲藏/食欲变化/异常叫声
+  moodTags   String[] @map("mood_tags")
+  /// 1-5 主观强度（可选）
+  severity   Int?
+  observedAt DateTime @map("observed_at") @db.Timestamptz()
+  notes      String?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  pet Pet @relation(fields: [petId], references: [id])
+
+  @@index([petId, observedAt])
+  @@map("pet_mood_logs")
+}

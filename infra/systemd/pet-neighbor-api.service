@@ -1,0 +1,20 @@
+[Unit]
+Description=Pet Neighbor API (NestJS, 127.0.0.1:3001) — Caddy 反代 /petn/api
+After=network.target postgresql@16-main.service
+Wants=postgresql@16-main.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/pet-neighbor/apps/api
+EnvironmentFile=/etc/pet-neighbor/api.env
+ExecStart=/usr/bin/node dist/main.js
+Restart=on-failure
+RestartSec=5
+# 文档 16.2：不把密钥写进日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=petn-api
+
+[Install]
+WantedBy=multi-user.target
